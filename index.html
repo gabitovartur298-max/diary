@@ -3958,17 +3958,68 @@
 
                 pages.forEach((pageCanvas, index) => {
                     if (index > 0) pdf.addPage();
-                    const imgData = pageCanvas.toDataURL('image/png');
-                    pdf.addImage(imgData, 'PNG', 0, 0, 210, 297, undefined, 'FAST');
+                    const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
+                    pdf.addImage(imgData, 'JPEG', 0, 0, 210, 297, undefined, 'FAST');
                 });
 
                 const nowFmt = formatTimestampInSelectedTz(Date.now(), false);
                 const fileName = `Symptom_Diary_Report_${nowFmt.datePart.replace(/\./g, '-')}.pdf`;
-                pdf.save(fileName);
+                const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user;
+
+                let sentToTelegramChat = false;
+
+                if (tgUser && tgUser.id) {
+                    try {
+                        const pdfDataUri = pdf.output('datauristring');
+                        const resp = await fetch('/api/bot', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                action: 'send_pdf',
+                                chatId: tgUser.id,
+                                fileName: fileName,
+                                pdfBase64: pdfDataUri,
+                                caption: state.lang === 'ru'
+                                    ? '📋 Ваш клинический PDF-отчёт из «Дневника симптомов»'
+                                    : '📋 Your Clinical PDF Report from Symptom Diary'
+                            })
+                        });
+                        const resJson = await resp.json();
+                        if (resJson && resJson.ok) {
+                            sentToTelegramChat = true;
+                        }
+                    } catch (apiErr) {
+                        console.warn('Telegram chat send fallback:', apiErr);
+                    }
+                }
+
+                if (sentToTelegramChat) {
+                    hideToast();
+                    showToast(
+                        '📩',
+                        state.lang === 'ru'
+                            ? 'PDF-отчёт отправлен вам в чат с ботом!'
+                            : 'PDF report sent to your bot chat!',
+                        true
+                    );
+                } else {
+                    const pdfBlob = pdf.output('blob');
+                    const pdfFile = new File([pdfBlob], fileName, { type: 'application/pdf' });
+
+                    if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
+                        await navigator.share({
+                            files: [pdfFile],
+                            title: fileName
+                        });
+                    } else {
+                        pdf.save(fileName);
+                    }
+                    hideToast();
+                }
             } catch (err) {
                 console.error("PDF generation error:", err);
-            } finally {
                 hideToast();
+            } finally {
                 if (downloadBtn) downloadBtn.disabled = false;
                 if (downloadBtnText) downloadBtnText.textContent = I18N[state.lang].modalDownloadPdf;
             }
