@@ -12,13 +12,12 @@ export default async function handler(req, res) {
     if (!BOT_TOKEN) {
         return res.status(500).json({
             ok: false,
-            error: 'Не задана переменная BOT_TOKEN в настройках Vercel (Settings -> Environment Variables)'
+            error: 'Не задана переменная BOT_TOKEN в настройках Vercel'
         });
     }
 
     const tgApiBase = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-    // 1. Быстрая привязка вебхука через браузер: https://ваш-сайт.vercel.app/api/bot?setup=1
     if (req.method === 'GET') {
         if (req.query.setup === '1') {
             const host = req.headers['x-forwarded-host'] || req.headers.host;
@@ -43,7 +42,7 @@ export default async function handler(req, res) {
     const body = req.body || {};
 
     try {
-        // 2. Автоматическое подтверждение оплаты Telegram Stars (pre_checkout_query)
+        // 1. Автоматическое подтверждение оплаты Telegram Stars
         if (body.pre_checkout_query) {
             await fetch(`${tgApiBase}/answerPreCheckoutQuery`, {
                 method: 'POST',
@@ -56,9 +55,12 @@ export default async function handler(req, res) {
             return res.status(200).json({ ok: true });
         }
 
-        // 3. Отправка PDF-отчёта пользователю прямо в чат с ботом
+        // 2. Корректное извлечение base64 (отрезаем всё до запятой) и отправка PDF в чат
         if (body.action === 'send_pdf' && body.chatId && body.pdfBase64) {
-            const cleanBase64 = body.pdfBase64.replace(/^data:application\/pdf;base64,/, '');
+            const cleanBase64 = body.pdfBase64.includes(',')
+                ? body.pdfBase64.split(',').pop().trim()
+                : body.pdfBase64.trim();
+
             const pdfBuffer = Buffer.from(cleanBase64, 'base64');
             const fileName = body.fileName || 'Symptom_Diary_Report.pdf';
 
