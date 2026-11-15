@@ -849,7 +849,7 @@
                 proActiveUntil: "Подписка PRO активна:",
                 proUntilWord: "до",
                 starsStackHint: "Сроки подписок суммируются при повторной покупке",
-                starsStackActivePrefix: "Накоплено сейчас:",
+                starsStackActivePrefix: "Осталось по подписке:",
                 starsStackBtnAddPrefix: "Продлить ещё на",
                 mainTrialBadge: "БЕСПЛАТНЫЙ ДОСТУП",
                 mainTrialBadgeClaimed: "ПРОБНЫЙ ПЕРИОД АКТИВИРОВАН",
@@ -989,7 +989,7 @@
                 proActiveUntil: "PRO Subscription active:",
                 proUntilWord: "until",
                 starsStackHint: "Subscription days stack when purchased multiple times",
-                starsStackActivePrefix: "Currently stacked:",
+                starsStackActivePrefix: "Subscription remaining:",
                 starsStackBtnAddPrefix: "Add",
                 mainTrialBadge: "FREE TRIAL OFFER",
                 mainTrialBadgeClaimed: "FREE TRIAL CLAIMED",
@@ -1450,7 +1450,16 @@
                 customDocTitle: null,
                 customDocSub: null
             },
-            entries: []
+            entries: [],
+            deletedEntryIds: [],
+            sync: {
+                ready: false,
+                saving: false,
+                pending: false,
+                timer: null,
+                applying: false,
+                lastSyncedAt: null
+            }
         };
 
         // ============================================================================
@@ -1484,38 +1493,40 @@
             return `symptom_diary_userdata_v2_${accId}`;
         }
 
+        function buildUserDataPayload() {
+            const customCategories = {};
+            const customTagsByCat = {};
+
+            ALL_CATEGORY_KEYS.forEach(k => {
+                const cat = CATEGORIES[k];
+                if (!cat) return;
+                if (cat.isCustom) {
+                    customCategories[k] = cat;
+                } else {
+                    const cTags = (cat.tags || []).filter(t => t.isCustom);
+                    if (cTags.length > 0) customTagsByCat[k] = cTags;
+                }
+            });
+
+            return {
+                lang: state.lang,
+                tzOffsetMinutes: state.tzOffsetMinutes,
+                entries: state.entries,
+                deletedEntryIds: [...state.deletedEntryIds],
+                customCategories,
+                customTagsByCat,
+                customDurations: DURATIONS.filter(d => d.isCustom),
+                pdfOptions: state.pdfOptions
+            };
+        }
+
         function saveUserDataToStorage() {
             try {
-                const customCategories = {};
-                const customTagsByCat = {};
-
-                ALL_CATEGORY_KEYS.forEach(k => {
-                    const cat = CATEGORIES[k];
-                    if (!cat) return;
-                    if (cat.isCustom) {
-                        customCategories[k] = cat;
-                    } else {
-                        const cTags = (cat.tags || []).filter(t => t.isCustom);
-                        if (cTags.length > 0) customTagsByCat[k] = cTags;
-                    }
-                });
-
-                const customDurations = DURATIONS.filter(d => d.isCustom);
-
-                const payload = {
-                    lang: state.lang,
-                    tzOffsetMinutes: state.tzOffsetMinutes,
-                    entries: state.entries,
-                    customCategories,
-                    customTagsByCat,
-                    customDurations,
-                    pdfOptions: state.pdfOptions
-                };
-
-                localStorage.setItem(getUserDataStorageKey(), JSON.stringify(payload));
+                localStorage.setItem(getUserDataStorageKey(), JSON.stringify(buildUserDataPayload()));
             } catch (e) {
                 console.warn("Storage save warning:", e);
             }
+            scheduleUserDataSync();
         }
 
         function loadUserDataFromStorage() {
@@ -1533,6 +1544,9 @@
                 }
                 if (Array.isArray(data.entries)) {
                     state.entries = data.entries;
+                }
+                if (Array.isArray(data.deletedEntryIds)) {
+                    state.deletedEntryIds = data.deletedEntryIds.filter(id => typeof id === 'string');
                 }
                 if (data.pdfOptions && typeof data.pdfOptions === 'object') {
                     state.pdfOptions = { ...state.pdfOptions, ...data.pdfOptions };
@@ -1569,6 +1583,152 @@
                 return true;
             } catch (e) {
                 return false;
+            }
+        }
+
+        function getTelegramInitData() {
+            return window.Telegram?.WebApp?.initData || '';
+        }
+
+        function getEntryRevision(entry) {
+            return Number(entry?.updatedAtMs || entry?.timestampMs || 0);
+        }
+
+        function mergeUserDataPayloads(localData, remoteData) {
+            const local = localData && typeof localData === 'object' ? localData : {};
+            const remote = remoteData && typeof remoteData === 'object' ? remoteData : {};
+            const merged = { ...remote, ...local };
+            const deletedEntryIds = new Set([
+                ...(Array.isArray(remote.deletedEntryIds) ? remote.deletedEntryIds : []),
+                ...(Array.isArray(local.deletedEntryIds) ? local.deletedEntryIds : [])
+            ]);
+            const entriesById = new Map();
+
+            [
+                ...(Array.isArray(remote.entries) ? remote.entries : []),
+                ...(Array.isArray(local.entries) ? local.entries : [])
+            ].forEach(entry => {
+                if (!entry || typeof entry.id !== 'string' || deletedEntryIds.has(entry.id)) return;
+                const previous = entriesById.get(entry.id);
+                if (!previous || getEntryRevision(entry) >= getEntryRevision(previous)) {
+                    entriesById.set(entry.id, entry);
+                }
+            });
+
+            merged.entries = [...entriesById.values()];
+            merged.deletedEntryIds = [...deletedEntryIds].filter(id => typeof id === 'string').slice(-2000);
+            merged.customCategories = {
+                ...(remote.customCategories || {}),
+                ...(local.customCategories || {})
+            };
+            merged.customTagsByCat = {};
+
+            const tagCategoryKeys = new Set([
+                ...Object.keys(remote.customTagsByCat || {}),
+                ...Object.keys(local.customTagsByCat || {})
+            ]);
+            tagCategoryKeys.forEach(categoryKey => {
+                const tagsById = new Map();
+                [
+                    ...(remote.customTagsByCat?.[categoryKey] || []),
+                    ...(local.customTagsByCat?.[categoryKey] || [])
+                ].forEach(tag => {
+                    if (tag && typeof tag.id === 'string') tagsById.set(tag.id, tag);
+                });
+                merged.customTagsByCat[categoryKey] = [...tagsById.values()];
+            });
+
+            const durationsById = new Map();
+            [
+                ...(Array.isArray(remote.customDurations) ? remote.customDurations : []),
+                ...(Array.isArray(local.customDurations) ? local.customDurations : [])
+            ].forEach(duration => {
+                if (duration && typeof duration.id === 'string') durationsById.set(duration.id, duration);
+            });
+            merged.customDurations = [...durationsById.values()];
+            merged.pdfOptions = {
+                ...(remote.pdfOptions || {}),
+                ...(local.pdfOptions || {})
+            };
+
+            return merged;
+        }
+
+        function scheduleUserDataSync() {
+            if (!state.sync.ready || state.sync.applying || !getTelegramInitData()) return;
+            clearTimeout(state.sync.timer);
+            state.sync.timer = setTimeout(() => {
+                syncUserDataWithServer();
+            }, 700);
+        }
+
+        async function fetchSyncWithTimeout(url, options = {}) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000);
+            try {
+                return await fetch(url, { ...options, signal: controller.signal });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+
+        async function syncUserDataWithServer() {
+            const initData = getTelegramInitData();
+            if (!initData || !state.sync.ready) return;
+            if (state.sync.saving) {
+                state.sync.pending = true;
+                return;
+            }
+
+            state.sync.saving = true;
+            try {
+                const localPayload = buildUserDataPayload();
+                const response = await fetchSyncWithTimeout('/api/sync', {
+                    method: 'GET',
+                    headers: { 'X-Telegram-Init-Data': initData },
+                    cache: 'no-store'
+                });
+
+                if (response.status === 401) return;
+                if (!response.ok) throw new Error(`Sync GET failed: ${response.status}`);
+
+                const remoteResponse = await response.json();
+                const mergedPayload = mergeUserDataPayloads(localPayload, remoteResponse.data);
+                const localSerialized = JSON.stringify(localPayload);
+                const mergedSerialized = JSON.stringify(mergedPayload);
+
+                if (mergedSerialized !== localSerialized) {
+                    try {
+                        localStorage.setItem(getUserDataStorageKey(), mergedSerialized);
+                    } catch (e) {}
+                    loadUserDataFromStorage();
+                    state.sync.applying = true;
+                    try {
+                        setLanguage(state.lang);
+                    } finally {
+                        state.sync.applying = false;
+                    }
+                }
+
+                if (!remoteResponse.data || mergedSerialized !== JSON.stringify(remoteResponse.data)) {
+                    const saveResponse = await fetchSyncWithTimeout('/api/sync', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ initData, data: mergedPayload })
+                    });
+                    if (!saveResponse.ok) throw new Error(`Sync POST failed: ${saveResponse.status}`);
+                }
+
+                state.sync.lastSyncedAt = Date.now();
+            } catch (error) {
+                console.warn('[v0] Diary sync warning:', error);
+            } finally {
+                state.sync.saving = false;
+                if (state.sync.pending) {
+                    state.sync.pending = false;
+                    clearTimeout(state.sync.timer);
+                    state.sync.timer = setTimeout(() => syncUserDataWithServer(), 150);
+                }
             }
         }
 
@@ -2453,7 +2613,8 @@
                     ru: rawText || fallbackNoteRu,
                     en: rawText || fallbackNoteEn
                 },
-                timestampMs: entryTimestampMs
+                timestampMs: entryTimestampMs,
+                updatedAtMs: Date.now()
             };
 
             if (checkAndEnforceSubscriptionExpiry()) {
@@ -2482,6 +2643,7 @@
         }
 
         function deleteSymptomEntry(id) {
+            if (!state.deletedEntryIds.includes(id)) state.deletedEntryIds.push(id);
             state.entries = state.entries.filter(item => item.id !== id);
             saveUserDataToStorage();
             renderEntriesList();
@@ -2804,6 +2966,12 @@
             return (state.subscription.totalMonths || 0) * 30;
         }
 
+        function getSubscriptionRemainingDays() {
+            if (!isSubscriptionCurrentlyValid()) return 0;
+            const remainingMs = Math.max(0, state.subscription.expiresAtMs - Date.now());
+            return Math.max(1, Math.ceil(remainingMs / (24 * 60 * 60 * 1000)));
+        }
+
         function formatDaysUnit(days, lang = state.lang) {
             if (lang === 'en') {
                 return days === 1 ? '1 day' : `${days} days`;
@@ -2985,7 +3153,7 @@
             });
 
             const chosen = STARS_PLANS[planKey];
-            const currentDays = isSubscriptionCurrentlyValid() ? getSubscriptionTotalDays() : 0;
+            const currentDays = getSubscriptionRemainingDays();
             const addedDays = chosen.days;
             const newTotalDays = currentDays + addedDays;
 
@@ -3144,20 +3312,20 @@
             }
 
             if (isSubscriptionCurrentlyValid()) {
-                const totalDays = getSubscriptionTotalDays();
-                const totalDaysFormatted = formatDaysUnit(totalDays, state.lang);
+                const remainingDays = getSubscriptionRemainingDays();
+                const remainingDaysFormatted = formatDaysUnit(remainingDays, state.lang);
                 const expFormatted = formatTimestampInSelectedTz(state.subscription.expiresAtMs, false);
 
                 headerBadge.classList.remove('hidden');
-                headerStarsLabel.textContent = `PRO (${totalDaysFormatted})`;
+                headerStarsLabel.textContent = `PRO (${remainingDaysFormatted})`;
                 expiryBox.classList.remove('hidden');
-                expiryText.textContent = `${t.proActiveUntil} ${totalDaysFormatted} (${t.proUntilWord} ${expFormatted.datePart})`;
-                bottomStatus.textContent = `${t.bottomSubStatusPro} • ${totalDaysFormatted}`;
+                expiryText.textContent = `${t.proActiveUntil} ${remainingDaysFormatted} (${t.proUntilWord} ${expFormatted.datePart})`;
+                bottomStatus.textContent = `${t.bottomSubStatusPro} • ${remainingDaysFormatted}`;
                 bottomHint.textContent = `${t.bottomSubHintPro} (${t.proUntilWord} ${expFormatted.datePart})`;
 
                 if (cumulativeText && cumulativeBadge) {
-                    cumulativeText.textContent = `${t.starsStackActivePrefix} ${totalDaysFormatted}`;
-                    cumulativeBadge.textContent = totalDaysFormatted;
+                    cumulativeText.textContent = `${t.starsStackActivePrefix} ${remainingDaysFormatted}`;
+                    cumulativeBadge.textContent = remainingDaysFormatted;
                     cumulativeBadge.classList.remove('hidden');
                 }
             } else {
@@ -3287,6 +3455,7 @@
             } else {
                 item.notes.en = newText;
             }
+            item.updatedAtMs = Date.now();
             saveUserDataToStorage();
             renderEntriesList();
         }
@@ -3481,6 +3650,7 @@
             return new Promise(resolve => {
                 if (!src) return resolve(null);
                 const img = new Image();
+                img.crossOrigin = 'anonymous';
                 img.onload = () => resolve(img);
                 img.onerror = () => resolve(null);
                 img.src = src;
@@ -3582,6 +3752,38 @@
             });
 
             return lines.length > 0 ? lines : ['—'];
+        }
+
+        async function savePdfToDevice(pdf, fileName) {
+            const pdfBlob = pdf.output('blob');
+            const pdfFile = new File([pdfBlob], fileName, { type: 'application/pdf' });
+
+            if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
+                try {
+                    await navigator.share({ files: [pdfFile], title: fileName });
+                    return 'shared';
+                } catch (error) {
+                    if (error?.name === 'AbortError') return 'cancelled';
+                }
+            }
+
+            if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+                const url = URL.createObjectURL(pdfBlob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = fileName;
+                link.target = '_blank';
+                link.rel = 'noopener';
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+                return 'downloaded';
+            }
+
+            pdf.save(fileName);
+            return 'downloaded';
         }
 
         async function downloadClinicalPdfFile() {
@@ -4003,18 +4205,13 @@
                         true
                     );
                 } else {
-                    const pdfBlob = pdf.output('blob');
-                    const pdfFile = new File([pdfBlob], fileName, { type: 'application/pdf' });
-
-                    if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
-                        await navigator.share({
-                            files: [pdfFile],
-                            title: fileName
-                        });
-                    } else {
-                        pdf.save(fileName);
-                    }
+                    const saveResult = await savePdfToDevice(pdf, fileName);
                     hideToast();
+                    if (saveResult === 'shared') {
+                        showToast('PDF', state.lang === 'ru' ? 'PDF готов к отправке или сохранению' : 'PDF is ready to share or save');
+                    } else if (saveResult === 'downloaded') {
+                        showToast('PDF', state.lang === 'ru' ? 'PDF открыт для скачивания' : 'PDF opened for download');
+                    }
                 }
             } catch (err) {
                 console.error("PDF generation error:", err);
@@ -4079,6 +4276,15 @@
             populateTimezoneSelect();
             initDailyGreetingTracker();
             setLanguage(state.lang || 'ru');
+
+            state.sync.ready = true;
+            syncUserDataWithServer();
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') syncUserDataWithServer();
+            });
+            setInterval(() => {
+                if (document.visibilityState === 'visible') syncUserDataWithServer();
+            }, 15000);
 
             setInterval(updateLiveClock, 1000);
             if (window.lucide) lucide.createIcons();
