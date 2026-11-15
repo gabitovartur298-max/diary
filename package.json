@@ -1,0 +1,15 @@
+{
+  "name": "symptom-diary",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "vercel dev",
+    "setup:db": "node scripts/setup-neon.mjs"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.4",
+    "pg": "^8.23.1"
+  }
+}
