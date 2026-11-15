@@ -17,16 +17,18 @@ export default async function handler(req, res) {
     }
 
     const tgApiBase = `https://api.telegram.org/bot${BOT_TOKEN}`;
+    const host = req.headers['x-forwarded-host'] || req.headers.host || 'diary-nu-eosin.vercel.app';
+    const appUrl = `https://${host}`;
 
+    // 1. Настройка вебхука: https://diary-nu-eosin.vercel.app/api/bot?setup=1
     if (req.method === 'GET') {
         if (req.query.setup === '1') {
-            const host = req.headers['x-forwarded-host'] || req.headers.host;
-            const webhookUrl = `https://${host}/api/bot`;
+            const webhookUrl = `${appUrl}/api/bot`;
             const tgRes = await fetch(`${tgApiBase}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
             const data = await tgRes.json();
             return res.status(200).json({
                 message: data.ok
-                    ? '✅ Вебхук успешно подключён! Оплата Звёздами и отправка PDF в чат работают.'
+                    ? '✅ Вебхук успешно подключён! Команда /start, оплата Звёздами и отправка PDF работают.'
                     : '❌ Ошибка подключения вебхука',
                 webhookUrl,
                 telegramResponse: data
@@ -42,7 +44,33 @@ export default async function handler(req, res) {
     const body = req.body || {};
 
     try {
-        // 1. Автоматическое подтверждение оплаты Telegram Stars
+        // 2. Ответ на команду /start
+        if (body.message && typeof body.message.text === 'string' && body.message.text.startsWith('/start')) {
+            const chatId = body.message.chat.id;
+
+            await fetch(`${tgApiBase}/sendMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    text: 'Привет! Чтобы попасть в приложение, нажимай на кнопку «Открыть дневник». Здоровья и удачи!',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                {
+                                    text: 'Открыть дневник',
+                                    web_app: { url: appUrl }
+                                }
+                            ]
+                        ]
+                    }
+                })
+            });
+
+            return res.status(200).json({ ok: true });
+        }
+
+        // 3. Автоматическое подтверждение оплаты Telegram Stars
         if (body.pre_checkout_query) {
             await fetch(`${tgApiBase}/answerPreCheckoutQuery`, {
                 method: 'POST',
@@ -55,7 +83,7 @@ export default async function handler(req, res) {
             return res.status(200).json({ ok: true });
         }
 
-        // 2. Корректное извлечение base64 (отрезаем всё до запятой) и отправка PDF в чат
+        // 4. Отправка PDF-отчёта пользователю прямо в чат с ботом
         if (body.action === 'send_pdf' && body.chatId && body.pdfBase64) {
             const cleanBase64 = body.pdfBase64.includes(',')
                 ? body.pdfBase64.split(',').pop().trim()
