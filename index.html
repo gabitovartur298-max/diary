@@ -3644,7 +3644,7 @@
         }
 
         // ============================================================================
-        // 13. ULTRA-HD 375 DPI DIRECT A4 CANVAS -> JSPDF GENERATOR
+        // 13. HIGH-RESOLUTION 300 DPI DIRECT A4 CANVAS -> JSPDF GENERATOR
         // ============================================================================
         function loadImageForPdfCanvas(src) {
             return new Promise(resolve => {
@@ -3754,6 +3754,95 @@
             return lines.length > 0 ? lines : ['—'];
         }
 
+        const PDF_UPLOAD_LIMIT = 3.5 * 1024 * 1024;
+        const PDF_IMAGE_QUALITY = 0.88;
+
+        function createClinicalPdfDocument(pageCanvases, imageQuality = PDF_IMAGE_QUALITY) {
+            const { jsPDF } = window.jspdf;
+            const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
+
+            pageCanvases.forEach((pageCanvas, index) => {
+                if (index > 0) pdf.addPage();
+                const imgData = pageCanvas.toDataURL('image/jpeg', imageQuality);
+                pdf.addImage(imgData, 'JPEG', 0, 0, 210, 297, undefined, 'FAST');
+            });
+
+            return pdf;
+        }
+
+        function getPdfPartFileName(fileName, partIndex, partCount) {
+            if (partCount === 1) return fileName;
+            const baseName = fileName.replace(/\.pdf$/i, '');
+            return `${baseName}_part_${partIndex + 1}_of_${partCount}.pdf`;
+        }
+
+        function buildPdfUploadParts(pdf, pageCanvases, fileName) {
+            const parts = [];
+
+            function appendPart(canvases, isOriginal = false) {
+                let partPdf = isOriginal ? pdf : createClinicalPdfDocument(canvases);
+                let blob = partPdf.output('blob');
+
+                if (blob.size > PDF_UPLOAD_LIMIT && canvases.length > 1) {
+                    const middle = Math.floor(canvases.length / 2);
+                    appendPart(canvases.slice(0, middle));
+                    appendPart(canvases.slice(middle));
+                    return;
+                }
+
+                if (blob.size > PDF_UPLOAD_LIMIT) {
+                    partPdf = createClinicalPdfDocument(canvases, 0.65);
+                    blob = partPdf.output('blob');
+                }
+
+                if (blob.size > PDF_UPLOAD_LIMIT) {
+                    throw new Error('PDF_PAGE_TOO_LARGE');
+                }
+
+                parts.push({ blob });
+            }
+
+            appendPart(pageCanvases, true);
+            return parts.map((part, index) => ({
+                ...part,
+                fileName: getPdfPartFileName(fileName, index, parts.length)
+            }));
+        }
+
+        async function sendPdfToTelegram(pdf, pageCanvases, fileName) {
+            const initData = getTelegramInitData();
+            const caption = state.lang === 'ru'
+                ? '📋 Ваш клинический PDF-отчёт из «Дневника симптомов»'
+                : '📋 Your Clinical PDF Report from Symptom Diary';
+            const parts = buildPdfUploadParts(pdf, pageCanvases, fileName);
+
+            for (let index = 0; index < parts.length; index++) {
+                const part = parts[index];
+                const partCaption = parts.length > 1
+                    ? `${caption}\n${state.lang === 'ru' ? `Часть ${index + 1} из ${parts.length}` : `Part ${index + 1} of ${parts.length}`}`
+                    : caption;
+                const query = new URLSearchParams({
+                    fileName: part.fileName,
+                    caption: partCaption
+                });
+                const response = await fetch(`/api/send-pdf?${query.toString()}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/pdf',
+                        'X-Telegram-Init-Data': initData
+                    },
+                    body: part.blob
+                });
+                const result = await response.json().catch(() => ({}));
+
+                if (!response.ok || !result.ok) {
+                    throw new Error(result.error || `PDF upload failed (${response.status})`);
+                }
+            }
+
+            return parts.length;
+        }
+
         async function savePdfToDevice(pdf, fileName) {
             const pdfBlob = pdf.output('blob');
             const pdfFile = new File([pdfBlob], fileName, { type: 'application/pdf' });
@@ -3800,7 +3889,7 @@
             // Даём браузеру отрисовать надпись «Подождите, идёт скачивание...» перед генерацией
             await new Promise(resolve => setTimeout(resolve, 60));
 
-            const SCALE = 2.5;
+            const SCALE = 2;
             const PAGE_W = 1240;
             const PAGE_H = 1754;
             const MARGIN = 56;
@@ -4155,67 +4244,68 @@
             }
 
             try {
-                const { jsPDF } = window.jspdf;
-                const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
-
-                pages.forEach((pageCanvas, index) => {
-                    if (index > 0) pdf.addPage();
-                    const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
-                    pdf.addImage(imgData, 'JPEG', 0, 0, 210, 297, undefined, 'FAST');
-                });
-
+                const pdf = createClinicalPdfDocument(pages);
                 const nowFmt = formatTimestampInSelectedTz(Date.now(), false);
                 const fileName = `Symptom_Diary_Report_${nowFmt.datePart.replace(/\./g, '-')}.pdf`;
                 const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user;
+                const initData = getTelegramInitData();
 
                 let sentToTelegramChat = false;
+                let telegramPartCount = 0;
+                let telegramSendError = null;
 
-                if (tgUser && tgUser.id) {
+                if (tgUser?.id && initData) {
                     try {
-                        const pdfDataUri = pdf.output('datauristring');
-                        const resp = await fetch('/api/bot', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                action: 'send_pdf',
-                                chatId: tgUser.id,
-                                fileName: fileName,
-                                pdfBase64: pdfDataUri,
-                                caption: state.lang === 'ru'
-                                    ? '📋 Ваш клинический PDF-отчёт из «Дневника симптомов»'
-                                    : '📋 Your Clinical PDF Report from Symptom Diary'
-                            })
-                        });
-                        const resJson = await resp.json();
-                        if (resJson && resJson.ok) {
-                            sentToTelegramChat = true;
-                        }
+                        telegramPartCount = await sendPdfToTelegram(pdf, pages, fileName);
+                        sentToTelegramChat = true;
                     } catch (apiErr) {
-                        console.warn('Telegram chat send fallback:', apiErr);
+                        telegramSendError = apiErr;
+                        console.warn('[v0] Telegram PDF delivery failed:', apiErr);
                     }
                 }
 
                 if (sentToTelegramChat) {
                     hideToast();
                     showToast(
-                        '📩',
+                        'PDF',
                         state.lang === 'ru'
-                            ? 'PDF-отчёт отправлен вам в чат с ботом!'
-                            : 'PDF report sent to your bot chat!',
+                            ? telegramPartCount > 1
+                                ? `PDF-отчёт отправлен в чат с ботом (${telegramPartCount} части).`
+                                : 'PDF-отчёт отправлен вам в чат с ботом!'
+                            : telegramPartCount > 1
+                                ? `PDF report sent to your bot chat in ${telegramPartCount} parts.`
+                                : 'PDF report sent to your bot chat!',
                         true
                     );
                 } else {
                     const saveResult = await savePdfToDevice(pdf, fileName);
                     hideToast();
-                    if (saveResult === 'shared') {
+                    if (telegramSendError) {
+                        showToast(
+                            'PDF',
+                            state.lang === 'ru'
+                                ? saveResult === 'cancelled'
+                                    ? 'Не удалось отправить PDF в чат. Попробуйте ещё раз.'
+                                    : 'Не удалось отправить PDF в чат. Файл сохранён локально.'
+                                : saveResult === 'cancelled'
+                                    ? 'Could not send the PDF to the chat. Please try again.'
+                                    : 'Could not send the PDF to the chat. The file was saved locally.'
+                        );
+                    } else if (saveResult === 'shared') {
                         showToast('PDF', state.lang === 'ru' ? 'PDF готов к отправке или сохранению' : 'PDF is ready to share or save');
                     } else if (saveResult === 'downloaded') {
                         showToast('PDF', state.lang === 'ru' ? 'PDF открыт для скачивания' : 'PDF opened for download');
                     }
                 }
             } catch (err) {
-                console.error("PDF generation error:", err);
+                console.error('PDF generation error:', err);
                 hideToast();
+                showToast(
+                    'PDF',
+                    state.lang === 'ru'
+                        ? 'Не удалось создать или отправить PDF. Попробуйте ещё раз.'
+                        : 'Could not create or send the PDF. Please try again.'
+                );
             } finally {
                 if (downloadBtn) downloadBtn.disabled = false;
                 if (downloadBtnText) downloadBtnText.textContent = I18N[state.lang].modalDownloadPdf;
