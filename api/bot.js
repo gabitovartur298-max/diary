@@ -350,12 +350,11 @@ export default async function handler(req, res) {
     // 7. Обязательная по правилам Telegram Stars команда /paysupport
     if (/^\/paysupport(@\w+)?(\s|$)/i.test(text)) {
       const supportContact = process.env.SUPPORT_CONTACT || (lang === 'en' ? 'support via the bot description' : 'поддержку через описание бота');
-      const userTgId = message.from?.id || chatId;
       await callTelegramApi('sendMessage', {
         chat_id: chatId,
         text: lang === 'en'
-          ? `Telegram Stars Payment Support:\n\nIf your PRO subscription did not activate immediately after payment, reopen the Mini App — status syncs with the server automatically.\n\nFor refunds or payment issues, contact ${supportContact} and include your Telegram ID: ${userTgId}.`
-          : `Поддержка по оплатам Telegram Stars:\n\nЕсли подписка PRO не активировалась сразу после оплаты, просто переоткройте Mini App — статус синхронизируется с сервером автоматически.\n\nПо вопросам возврата и сбоев оплаты напишите в ${supportContact} и укажите ваш Telegram ID: ${userTgId}.`
+          ? `Telegram Stars Payment Support:\n\nIf your PRO subscription did not activate immediately after payment, reopen the Mini App — status syncs with the server automatically.\n\nFor refunds or payment issues, contact ${supportContact}.`
+          : `Поддержка по оплатам Telegram Stars:\n\nЕсли подписка PRO не активировалась сразу после оплаты, просто переоткройте Mini App — статус синхронизируется с сервером автоматически.\n\nПо вопросам возврата и сбоев оплаты напишите в ${supportContact}.`
       });
       return res.status(200).json({ ok: true });
     }
